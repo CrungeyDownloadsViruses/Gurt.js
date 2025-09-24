@@ -1,0 +1,35 @@
+{
+  "name": "gurtjs",
+  "version": "1.0.3",
+  "description": "This is a module designed to run a web server similar to express on FaceDev's Gurt protocall via javascript.",
+  "main": "gurt-tls-upgrade.js",
+  "exports": {
+    ".": "./gurt-tls-upgrade.js",
+    "./server": "./gurt-server.js"
+  },
+  "files": [
+    "gurt-tls-upgrade.js",
+    "gurt-server.js",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node gurt-server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MD1125/gurted.git"
+  },
+  "keywords": [
+    "tls",
+    "upgrade",
+    "framework",
+    "server",
+    "express-like",
+    "gurt",
+    "gurtjs",
+    "gurted"
+  ],
+  "author": "Crungey",
+  "license": "MIT",
+  "dependencies": {}
+}
