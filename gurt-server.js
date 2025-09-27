@@ -8,9 +8,11 @@ class GURTServer extends EventEmitter {
   constructor(options = {}) {
     super();
     this.tlsOptions = options.tls || {};
-    this.isLocalCert = options.isLocalCert ?? false; 
-    this.forceServername = options.forceServername || null; // 👈 new option
+    this.isLocalCert = options.isLocalCert ?? false;
+    this.forceServername = options.forceServername || null;
     this.routes = {};
+    this.server = null; // store server reference
+    this.retryDelay = 3000; // delay before restart on crash
   }
 
   // Route registration
@@ -25,14 +27,39 @@ class GURTServer extends EventEmitter {
   options(path, handler) { this.route("OPTIONS", path, handler); }
   patch(path, handler) { this.route("PATCH", path, handler); }
 
-  listen(port, host) {
-    const server = net.createServer((socket) => this.handleConnection(socket));
-    server.listen(port, host);
+  listen(port, host = "0.0.0.0") {
+    const startServer = () => {
+      this.server = net.createServer((socket) => this.handleConnection(socket));
+
+      this.server.on("error", (err) => {
+        console.error(`[SERVER] Fatal error: ${err.code || err.message}`);
+        this.server.close(() => {
+          console.log("[SERVER] Attempting to restart...");
+          setTimeout(() => startServer(), this.retryDelay);
+        });
+      });
+
+      this.server.listen(port, host, () => {
+        console.log(`[SERVER] Listening on ${host}:${port}`);
+      });
+    };
+
+    startServer();
   }
 
   handleConnection(socket) {
     const addr = `${socket.remoteAddress}:${socket.remotePort}`;
     console.log(`[TCP] Client connected: ${addr}`);
+
+    socket.on("error", (err) => {
+      console.error(`[TCP] Socket error from ${addr}:`, err.message);
+      socket.destroy();
+    });
+
+    socket.on("end", () => {
+      console.log(`[TCP] Client disconnected: ${addr}`);
+      socket.destroy();
+    });
 
     let buffer = "";
     socket.on("data", (data) => {
@@ -51,7 +78,6 @@ class GURTServer extends EventEmitter {
           socket.write(response);
           console.log(`[TCP] Sent handshake response to ${addr}`);
 
-          // Inject SNI if configured
           const tlsOptions = {
             ...this.tlsOptions,
             isServer: true,
@@ -60,7 +86,7 @@ class GURTServer extends EventEmitter {
           };
 
           if (this.forceServername) {
-            tlsOptions.servername = this.forceServername; // 👈 force certificate name
+            tlsOptions.servername = this.forceServername;
             console.log(`[TLS] Forcing servername SNI: ${this.forceServername}`);
           }
 
@@ -71,75 +97,78 @@ class GURTServer extends EventEmitter {
           });
 
           tlsSocket.on("error", (err) => {
-            console.error(`[TLS] Error code: ${err.code}`);
-            console.error(`[TLS] Library: ${err.library}`);
-            console.error(`[TLS] Reason: ${err.reason}`);
-            console.error(`[TLS] Full stack:`, err);
+            console.error(`[TLS] Error from ${addr}: ${err.code} - ${err.message}`);
+            tlsSocket.destroy();
+          });
+
+          tlsSocket.on("end", () => {
+            console.log(`[TLS] Client TLS disconnected: ${addr}`);
             tlsSocket.destroy();
           });
 
           tlsSocket.on("data", (data) => {
-  if (!data) return;
-  const reqStr = data.toString("utf8");
-  console.log(`[TLS] Received from ${addr}:\n${reqStr}`);
+            if (!data) return;
+            const reqStr = data.toString("utf8");
+            console.log(`[TLS] Received from ${addr}:\n${reqStr}`);
 
-  // Parse request
-  const [methodLine, ...headerLines] = reqStr.split("\r\n");
-  const [method, rawPath] = methodLine.split(" ");
+            const [methodLine, ...headerLines] = reqStr.split("\r\n");
+            const [method, rawPath] = methodLine.split(" ");
 
-  const headers = {};
-  let body = "";
-  let isBody = false;
+            const headers = {};
+            let body = "";
+            let isBody = false;
 
-  headerLines.forEach((line) => {
-    if (line === "") { isBody = true; return; }
-    if (isBody) body += line + "\n";
-    else {
-      const [key, ...rest] = line.split(":");
-      headers[key.toLowerCase()] = rest.join(":").trim();
-    }
-  });
+            headerLines.forEach((line) => {
+              if (line === "") { isBody = true; return; }
+              if (isBody) body += line + "\n";
+              else {
+                const [key, ...rest] = line.split(":");
+                headers[key.toLowerCase()] = rest.join(":").trim();
+              }
+            });
 
-  // 👇 Separate path & query
-  const [path, queryString] = rawPath.split("?");
-  const host = headers["host"] || "localhost";
+            let [path, queryString] = [];
+            try {
+              [path, queryString] = rawPath.split("?");
+            } catch (err) {
+              console.error(`[TLS] Error parsing URL: ${err}`);
+              path = rawPath;
+              queryString = "";
+            }
 
-  // 👇 Full URL (with query string if present)
-  const url = queryString ? `${host}${path}?${queryString}` : `${host}${path}`;
+            const host = headers["host"] || "localhost";
+            const url = queryString ? `${host}${path}?${queryString}` : `${host}${path}`;
 
-  // Store on socket for easy access
-  tlsSocket.url = url;
+            tlsSocket.url = url;
 
-  const routeKey = `${method.toUpperCase()} ${path}`; // only use base path for routing
-  const handler = this.routes[routeKey];
+            const routeKey = `${method.toUpperCase()} ${path}`;
+            const handler = this.routes[routeKey];
 
-  if (handler) {
-    handler({
-      socket: tlsSocket,
-      addr,
-      request: reqStr,
-      headers,
-      body,
-      method,
-      path,        // base path only
-      queryString, // query part only
-      url,         // full url with params
-    });
-  } else {
-    const resBody = "Not Found";
-    const response =
-      `GURT/1.0.0 404 Not Found\r\n` +
-      "content-type: text/plain\r\n" +
-      `content-length: ${Buffer.byteLength(resBody)}\r\n` +
-      "server: GURT/1.0.0\r\n" +
-      "date: " + new Date().toUTCString() + "\r\n\r\n" +
-      resBody;
+            if (handler) {
+              handler({
+                socket: tlsSocket,
+                addr,
+                request: reqStr,
+                headers,
+                body,
+                method,
+                path,
+                queryString,
+                url,
+              });
+            } else {
+              const resBody = "Not Found";
+              const response =
+                `GURT/1.0.0 404 Not Found\r\n` +
+                "content-type: text/plain\r\n" +
+                `content-length: ${Buffer.byteLength(resBody)}\r\n` +
+                "server: GURT/1.0.0\r\n" +
+                "date: " + new Date().toUTCString() + "\r\n\r\n" +
+                resBody;
 
-    tlsSocket.write(response);
-  }
-});
-
-
+              tlsSocket.write(response);
+            }
+          });
 
           buffer = "";
         } else {
@@ -148,8 +177,6 @@ class GURTServer extends EventEmitter {
         }
       }
     });
-
-    socket.on("end", () => console.log(`[TCP] Client disconnected: ${addr}`));
   }
 }
 
